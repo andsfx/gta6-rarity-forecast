@@ -19,27 +19,31 @@ so mu is the centre on the logit scale and sigma the spread there.
 
 Step 1, the dilution slope. A trophy with at least two distinct rates across its history gets a
 least squares line through logit(rate) against ln(players tracked), whose slope b_i is the
-per-trophy dilution law. A trophy with fewer than two distinct rates sits on a stale page - the
-reads only repeat one value, and the next refresh dilutes it. That branch shifts the centre down
-by 0.85 * ln(6) logit units (launch night multiplied the tracked players by about six) below the
-last rate and stops there, with a flat spread of 0.55.
+per-trophy dilution law: as Exophase tracks more players, every earn rate falls along that line.
+A trophy with fewer than two distinct rates sits on a stale page - the reads only repeat one
+value, and the next refresh dilutes it. That branch shifts the centre down by 0.85 * ln(6) logit
+units (launch night multiplied the tracked players by about six) below the last rate and stops
+there, with a flat spread of 0.55 and no horizon widening; the remaining steps are skipped.
 
 Step 2, the strata. The last rate cuts the field into S0 r >= 15, S1 2 <= r < 15, S2 0.2 <= r < 2
 and S3 r < 0.2.
 
 Step 3, hierarchical shrinkage. b_strata is the median of the finite b_j of the trophies in the
 same strata, and the working slope is b_shrunk = (b_i + 2 * b_strata) / 3: a median built from
-dozens of trophies is far more stable than one trophy's line.
+dozens of trophies is far more stable than one trophy's line, so each slope borrows strength from
+its strata. A trophy whose own line is unidentified (ln N never varies) uses the strata median
+outright.
 
-Step 4, power-law players. ln(N_t) = a + b * ln(t + c) is fit over all reads, t the days since the
-first read, with c searched over a grid and each fit scored by its SSE on the last eight reads
-only, so the law that best tracks the most recent growth wins. Reading the winner at the case's
-target time gives ln(N_target); the growth dlnN = ln(N_target) - ln(N_last) is held between 1x and
-50x the last count.
+Step 4, power-law players. ln(N_t) = a + b * ln(t + c) is fit over all reads, t the days since
+the first read, with c searched over a grid and each fit scored by its SSE on the last eight
+reads only, so the law that best tracks the most recent growth wins. Reading the winner at the
+case's target time gives ln(N_target); the growth dlnN = ln(N_target) - ln(N_last) is held
+between 1x and 50x the last count.
 
 Step 5, the centre. mu = logit(r) + b_shrunk * dlnN + drift_per_day * horizon_days, where the
 drift is a cross-game estimate of how each strata's median moves per day as players work through
-the story (S1 story trophies rebound, S2 and S3 follow weaker, S0 none).
+the story: S0 none, S1 story trophies rebound at 0.92 / 4.5 per day, S2 and S3 follow weaker.
+The horizon in days is the case's horizon_minutes over 1440.
 
 Step 6, the spread. sigma_samp = 0.2 * sqrt(1 / (N p (1-p))) is the sampling noise of the last
 count itself, kept small so it stays a floor. The residual part is the root mean square of the
@@ -47,10 +51,12 @@ count itself, kept small so it stays a floor. The residual part is the root mean
 per-strata table otherwise. sigma = max(0.20, min(1.60, sigma_samp + sd_resid)) times
 (1 + 0.10 * sqrt(horizon_days)), capped at 1.60 overall.
 
-Step 7, the quantiles. inv_logit(mu + z * sigma) at the five z levels, rounded to four decimals
-and made non-decreasing. A trophy whose last rate is 100.00% is pinned at 99.99 on every level.
-A trophy with no rate anywhere in the history gets a fixed wide row [0.1, 1.0, 5.0, 20.0, 60.0].
-Every step is plain arithmetic over the case file, so two runs write identical bytes.
+Step 7, the quantiles. inv_logit(mu + z * sigma) at the five z levels, rounded to four decimals,
+then sorted so the five levels never cross. A trophy whose last rate is 100.00% is pinned at
+99.99 on every level: it has never diluted in the measured field and the true value is clamped
+at 99.99 anyway, so the pin overrides both the stale shift and the dilution forecast. A trophy
+with no rate anywhere in the history gets a fixed wide row [0.1, 1.0, 5.0, 20.0, 60.0]. Every
+step is plain arithmetic over the case file, so two runs write identical bytes.
 """
 
 import json
@@ -77,8 +83,10 @@ PIN_THRESHOLD = 100.0 - 1e-9
 
 DAY_MINUTES = 1440.0
 
-# The stale page: mu = logit(r_last) + STALE_SHIFT, flat spread, and no horizon widening.
-STALE_SHIFT = -0.85 * math.log(6.0)
+# The stale page: mu = logit(r_last) + STALE_MU_SHIFT, a flat spread.
+STALE_ALPHA = 0.85
+STALE_K = 6.0
+STALE_MU_SHIFT = -STALE_ALPHA * math.log(STALE_K)
 STALE_SIGMA = 0.55
 
 # Per-strata spread table for trophies whose history is too short for residuals.
@@ -92,7 +100,7 @@ C_GRID = (0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0)
 SSE_TAIL = 8
 RATIO_MAX = 50.0
 
-# Regime B's spread: max(0.20, min(1.60, SAMP_SCALE * sqrt(1 / (N p (1-p))) + sd_resid)) times
+# Step 6: max(0.20, min(1.60, SAMP_SCALE * sqrt(1 / (N p (1-p))) + sd_resid)) times
 # (1 + SIGMA_HORIZON * sqrt(horizon_days)), capped at SIGMA_CAP overall.
 SAMP_SCALE = 0.2
 P_FLOOR = 0.0001
@@ -221,7 +229,10 @@ def linear_fit(points):
 
 
 def trophy_series(history, index):
-    """[(players or None, rate), ...] over the reads that list the trophy, oldest first."""
+    """[(players or None, rate), ...] over the reads that list the trophy, oldest first.
+
+    Null rates are skipped, so the series is the trophy's non-null rate history in read order.
+    """
     series = []
     for read in history:
         if not isinstance(read, dict):
@@ -263,7 +274,8 @@ def dilution_fit(series):
 
     Returns (fit_points, (slope, intercept)) where fit_points are the [(ln N, logit rate), ...]
     the line was fit on, or (fit_points, None) when the line is not identified (ln N never
-    varies, or fewer than two points carry a player count).
+    varies, or fewer than two points carry a player count). Reads without a player count are
+    left out of the fit: a point needs both coordinates.
     """
     fit_points = []
     for players, rate in series:
@@ -275,24 +287,25 @@ def dilution_fit(series):
 def players_projection(history, target, horizon_days):
     """ln(players) at the target from the best power law over the reads, or None.
 
-    Fits ln(N) = intercept + slope * ln(t + c) with t the days since the first read. Each c of
-    the grid gets a closed-form least squares fit, scored by its SSE on the last reads only, and
-    the winner is read at the target's time.
+    Fits ln(N) = intercept + slope * ln(t + c) with t the days since the first read. Each read's
+    time is its ``at`` field or, when that does not parse, its ``slot``; the first read with a
+    usable time anchors t = 0. Each c of the grid gets a closed-form least squares fit, scored
+    by its SSE on the last reads only, and the winner is read at the target's time.
     """
     timed = []
     origin = None
     for read in history:
         if not isinstance(read, dict):
             continue
-        players = finite_number(read.get("players_tracked"))
-        if players is None or players <= 0.0:
-            continue
         instant = read_time(read)
         if instant is None:
             continue
-        base = origin if origin is not None else instant
-        origin = base
-        timed.append(((instant - base) / 86400.0, math.log(players)))
+        if origin is None:
+            origin = instant
+        players = finite_number(read.get("players_tracked"))
+        if players is None or players <= 0.0:
+            continue
+        timed.append(((instant - origin) / 86400.0, math.log(players)))
     if len(timed) < 2:
         return None
 
@@ -302,7 +315,7 @@ def players_projection(history, target, horizon_days):
     else:
         t_target = timed[-1][0] + horizon_days
 
-    best = None  # (sse, intercept, slope, c)
+    best = None  # (sse, intercept, slope, c); ties keep the first grid c, so runs are identical
     for c in C_GRID:
         xs = []
         ys = []
@@ -352,23 +365,17 @@ def last_players(series, history):
 
 
 def emit_quantiles(mu, sigma):
-    """The five rounded, non-decreasing percent quantiles of inv_logit(mu + z * sigma)."""
+    """The five rounded, non-decreasing percent quantiles of inv_logit(mu + z * sigma).
+
+    The raw levels are clamped into 0.0001..99.9999, rounded to four decimals and sorted, which
+    is exactly the spec's non-decreasing enforcement: the levels can never cross after sorting.
+    """
     if not (math.isfinite(mu) and math.isfinite(sigma)):
         return list(FALLBACK_Q)
     raw = [percent(mu + z * sigma) for z in Z]
     if any(not math.isfinite(value) for value in raw):
         return list(FALLBACK_Q)
-
-    quantiles = [clamp(value, QUANTILE_FLOOR, QUANTILE_CEIL) for value in raw]
-    quantiles.sort()
-    for i in range(1, len(quantiles)):
-        if quantiles[i] < quantiles[i - 1]:
-            quantiles[i] = quantiles[i - 1]
-    rounded = [round4(q) for q in quantiles]
-    for i in range(1, len(rounded)):
-        if rounded[i] < rounded[i - 1]:
-            rounded[i] = rounded[i - 1]
-    return rounded
+    return sorted(round4(clamp(value, QUANTILE_FLOOR, QUANTILE_CEIL)) for value in raw)
 
 
 def forecast_trophy(entry, history, horizon_days, ln_target, strata_slopes):
@@ -384,7 +391,7 @@ def forecast_trophy(entry, history, horizon_days, ln_target, strata_slopes):
 
     if entry["distinct"] < 2:
         # Stale page: shift the last rate down by the launch-night dilution and stop.
-        return emit_quantiles(logit(r_last) + STALE_SHIFT, STALE_SIGMA)
+        return emit_quantiles(logit(r_last) + STALE_MU_SHIFT, STALE_SIGMA)
 
     stratum = entry["stratum"]
     fit = entry.get("fit")
@@ -392,10 +399,9 @@ def forecast_trophy(entry, history, horizon_days, ln_target, strata_slopes):
 
     # Step 3: shrink the noisy per-trophy slope two-thirds toward its strata's median slope.
     if fit is not None:
-        slope_i, intercept_i = fit
+        slope_i, _intercept_i = fit
         b_shrunk = (slope_i + 2.0 * strata_slopes[stratum]) / 3.0
     else:
-        slope_i = intercept_i = None
         b_shrunk = strata_slopes[stratum]
 
     # Step 4: the projected growth, in ln(players), held between 1x and 50x the last count.
@@ -405,8 +411,9 @@ def forecast_trophy(entry, history, horizon_days, ln_target, strata_slopes):
     else:
         dlnN = 0.0
 
-    # Step 5: the centre.
-    mu = logit(r_last) + b_shrunk * dlnN + STRATA_DRIFT_PER_DAY[stratum] * horizon_days
+    # Step 5: the centre - dilution along the strata-shrunk slope, plus the rebound drift.
+    drift = STRATA_DRIFT_PER_DAY[stratum] * horizon_days
+    mu = logit(r_last) + b_shrunk * dlnN + drift
 
     # Step 6: the spread - the sampling noise of the last count plus the fit's residual noise.
     p = clamp(r_last / 100.0, P_FLOOR, P_CEIL)
@@ -414,7 +421,8 @@ def forecast_trophy(entry, history, horizon_days, ln_target, strata_slopes):
         sigma_samp = SAMP_SCALE * math.sqrt(1.0 / (n_last * p * (1.0 - p)))
     else:
         sigma_samp = 0.0
-    if fit is not None and entry["distinct"] >= 4 and fit_points:
+    if fit is not None and entry["distinct"] >= 4:
+        slope_i, intercept_i = fit
         squares = 0.0
         for x, y in fit_points:
             diff = y - (intercept_i + slope_i * x)
